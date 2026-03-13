@@ -10,7 +10,7 @@ use reqwest::redirect;
 use crate::allowlist::{DomainAllowlist, is_private_ip};
 use crate::config::{HttpClientConfig, RetryConfig};
 use crate::error::{Error, Result};
-use crate::types::{FetchRequest, FetchResponse};
+use crate::types::{BodyEncoding, ExecuteResult, FetchRequest, FetchResponseMetadata};
 
 /// Headers that are always forbidden in per-request and default headers.
 ///
@@ -283,10 +283,10 @@ impl HttpClientState {
    /// 5xx responses — these are valid HTTP responses, not transport errors).
    /// Intermediate retryable responses are fully read and discarded; the
    /// caller only sees the final attempt's response body.
-   pub async fn execute(&self, req: FetchRequest) -> Result<FetchResponse> {
+   pub(crate) async fn execute(&self, req: FetchRequest) -> Result<ExecuteResult> {
       let method = parse_method(req.method.as_deref().unwrap_or("GET"))?;
       let body_bytes = match req.body {
-         Some(ref b) => Some(decode_request_body(b, req.body_encoding.as_deref())?),
+         Some(ref b) => Some(decode_request_body(b, req.body_encoding.as_ref())?),
          None => None,
       };
       let timeout = req
@@ -303,15 +303,26 @@ impl HttpClientState {
       // doesn't change between retries, so re-parsing is unnecessary.
       let url = self.allowlist.read().validate_url(&req.url)?;
 
-      let mut last_result: Option<Result<FetchResponse>> = None;
+      let mut last_result: Option<Result<ExecuteResult>> = None;
       let mut attempt: u32 = 0;
 
       // Bounded: returns when attempt + 1 >= max_attempts (should_retry = false)
       loop {
-         assert!(
-            attempt < max_attempts,
-            "retry loop exceeded max_attempts ({max_attempts}); this is a bug"
-         );
+         if attempt >= max_attempts {
+            // Invariant: structurally unreachable — should_retry prevents
+            // attempt from reaching max_attempts. This is a defensive
+            // check against an impossible condition, not normal error
+            // handling. If triggered, the retry loop has a logic bug.
+            tracing::error!(
+               attempt,
+               max_attempts,
+               url = %req.url,
+               "retry loop exceeded max_attempts; this is a bug"
+            );
+            return Err(Error::Other(format!(
+               "retry loop exceeded max_attempts ({max_attempts}); this is a bug"
+            )));
+         }
 
          if attempt > 0 {
             let backoff = calculate_backoff(retry_config, attempt, last_result.as_ref());
@@ -341,8 +352,10 @@ impl HttpClientState {
          let should_retry = attempt + 1 < max_attempts && method_retryable;
 
          match result {
-            Ok(resp) if should_retry && retry_config.is_retryable_status(resp.status) => {
-               last_result = Some(Ok(resp));
+            Ok(ref resp)
+               if should_retry && retry_config.is_retryable_status(resp.metadata.status) =>
+            {
+               last_result = Some(result);
                attempt += 1;
             }
             Err(e) if should_retry && e.is_retryable() => {
@@ -350,7 +363,7 @@ impl HttpClientState {
                attempt += 1;
             }
             Ok(mut resp) => {
-               resp.retry_count = attempt;
+               resp.metadata.retry_count = attempt;
                return Ok(resp);
             }
             Err(e) => return Err(e),
@@ -362,6 +375,9 @@ impl HttpClientState {
    ///
    /// This is the inner implementation called by [`execute`](Self::execute)
    /// on each attempt. It assumes URL validation has already been performed.
+   ///
+   /// Returns raw body bytes and metadata. Encoding for IPC transfer
+   /// (binary framing or JSON with base64) happens at the command layer.
    async fn execute_once(
       &self,
       url: &url::Url,
@@ -369,7 +385,7 @@ impl HttpClientState {
       headers: &Option<HashMap<String, String>>,
       body: Option<&[u8]>,
       timeout: Option<Duration>,
-   ) -> Result<FetchResponse> {
+   ) -> Result<ExecuteResult> {
       let mut builder = self.client.request(method.clone(), url.clone());
 
       for (key, value) in &self.config.default_headers {
@@ -425,15 +441,6 @@ impl HttpClientState {
       // Collect response headers (multi-value support)
       let mut response_headers: HashMap<String, Vec<String>> = HashMap::new();
 
-      // Extract content type and Retry-After before consuming the response
-      // via bytes_stream(), since we need them later.
-      let content_type = response
-         .headers()
-         .get(reqwest::header::CONTENT_TYPE)
-         .and_then(|v| v.to_str().ok())
-         .unwrap_or("")
-         .to_string();
-
       for (name, value) in response.headers() {
          let name = name.as_str().to_string();
 
@@ -447,28 +454,16 @@ impl HttpClientState {
 
       let body_bytes = self.read_body_with_limit(response).await?;
 
-      let is_text = is_text_content_type(&content_type);
-      let (body, body_encoding) = if is_text {
-         (
-            String::from_utf8_lossy(&body_bytes).into_owned(),
-            "utf8".to_string(),
-         )
-      } else {
-         (
-            base64::engine::general_purpose::STANDARD.encode(&body_bytes),
-            "base64".to_string(),
-         )
-      };
-
-      Ok(FetchResponse {
-         status: status.as_u16(),
-         status_text,
-         headers: response_headers,
-         body,
-         body_encoding,
-         url: final_url.to_string(),
-         redirected,
-         retry_count: 0, // Set by execute() after the loop
+      Ok(ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: status.as_u16(),
+            status_text,
+            headers: response_headers,
+            url: final_url.to_string(),
+            redirected,
+            retry_count: 0, // Set by execute() after the loop
+         },
+         body: body_bytes,
       })
    }
 
@@ -553,33 +548,13 @@ fn parse_method(method: &str) -> Result<reqwest::Method> {
    }
 }
 
-fn decode_request_body(body: &str, encoding: Option<&str>) -> Result<Vec<u8>> {
-   match encoding.unwrap_or("utf8") {
-      "base64" => base64::engine::general_purpose::STANDARD
+fn decode_request_body(body: &str, encoding: Option<&BodyEncoding>) -> Result<Vec<u8>> {
+   match encoding.unwrap_or(&BodyEncoding::Utf8) {
+      BodyEncoding::Utf8 => Ok(body.as_bytes().to_vec()),
+      BodyEncoding::Base64 => base64::engine::general_purpose::STANDARD
          .decode(body)
          .map_err(|e| Error::Other(format!("invalid base64 body: {e}"))),
-      _ => Ok(body.as_bytes().to_vec()),
    }
-}
-
-/// Determines if a Content-Type value represents text content.
-///
-/// Uses substring matching on the full content-type so that structured
-/// types like `application/vnd.api+json` are correctly detected as text.
-fn is_text_content_type(content_type: &str) -> bool {
-   let ct = content_type.to_lowercase();
-
-   ct.starts_with("text/")
-      || ct.contains("json")
-      || ct.contains("xml")
-      || ct.contains("javascript")
-      || ct.contains("html")
-      || ct.contains("css")
-      || ct.contains("svg")
-      || ct.contains("yaml")
-      || ct.contains("toml")
-      || ct.contains("csv")
-      || ct.contains("form-urlencoded")
 }
 
 /// Calculates the backoff duration for a retry attempt using exponential
@@ -593,7 +568,7 @@ fn is_text_content_type(content_type: &str) -> bool {
 fn calculate_backoff(
    config: &RetryConfig,
    attempt: u32,
-   last_result: Option<&Result<FetchResponse>>,
+   last_result: Option<&Result<ExecuteResult>>,
 ) -> Duration {
    // Check for Retry-After header on the last response
    if let Some(Ok(resp)) = last_result
@@ -628,8 +603,8 @@ fn calculate_backoff(
 ///
 /// Supports both delta-seconds format (`Retry-After: 120`) and ignores
 /// HTTP-date format (too complex to parse without a date library).
-fn parse_retry_after_from_response(resp: &FetchResponse) -> Option<Duration> {
-   let values = resp.headers.get("retry-after")?;
+fn parse_retry_after_from_response(resp: &ExecuteResult) -> Option<Duration> {
+   let values = resp.metadata.headers.get("retry-after")?;
    let value = values.first()?;
 
    value.trim().parse::<u64>().ok().map(Duration::from_secs)
@@ -722,21 +697,21 @@ mod tests {
 
    #[test]
    fn test_decode_request_body_utf8() {
-      let body = decode_request_body("hello", Some("utf8")).unwrap();
+      let body = decode_request_body("hello", Some(&BodyEncoding::Utf8)).unwrap();
 
       assert_eq!(body, b"hello");
    }
 
    #[test]
    fn test_decode_request_body_base64() {
-      let body = decode_request_body("aGVsbG8=", Some("base64")).unwrap();
+      let body = decode_request_body("aGVsbG8=", Some(&BodyEncoding::Base64)).unwrap();
 
       assert_eq!(body, b"hello");
    }
 
    #[test]
    fn test_decode_request_body_invalid_base64() {
-      assert!(decode_request_body("not valid base64!!!", Some("base64")).is_err());
+      assert!(decode_request_body("not valid base64!!!", Some(&BodyEncoding::Base64)).is_err());
    }
 
    #[test]
@@ -744,44 +719,6 @@ mod tests {
       let body = decode_request_body("hello", None).unwrap();
 
       assert_eq!(body, b"hello");
-   }
-
-   #[test]
-   fn test_is_text_content_type() {
-      assert!(is_text_content_type("text/plain"));
-      assert!(is_text_content_type("text/html; charset=utf-8"));
-      assert!(is_text_content_type("application/json"));
-      assert!(is_text_content_type("application/xml"));
-      assert!(is_text_content_type("application/javascript"));
-      assert!(is_text_content_type("text/css"));
-      assert!(is_text_content_type("image/svg+xml"));
-      assert!(is_text_content_type("application/x-www-form-urlencoded"));
-
-      assert!(!is_text_content_type("application/octet-stream"));
-      assert!(!is_text_content_type("image/png"));
-      assert!(!is_text_content_type("application/pdf"));
-   }
-
-   #[test]
-   fn test_is_text_content_type_yaml_toml_csv() {
-      assert!(is_text_content_type("application/yaml"));
-      assert!(is_text_content_type("application/toml"));
-      assert!(is_text_content_type("text/csv"));
-   }
-
-   #[test]
-   fn test_is_text_content_type_empty_string() {
-      assert!(!is_text_content_type(""));
-   }
-
-   #[test]
-   fn test_yaml_content_type_is_text() {
-      assert!(is_text_content_type("application/x-yaml"));
-   }
-
-   #[test]
-   fn test_content_type_with_charset_detected() {
-      assert!(is_text_content_type("text/plain; charset=iso-8859-1"));
    }
 
    #[test]
@@ -800,13 +737,6 @@ mod tests {
          msg.contains("TRACE"),
          "error should contain method name: {msg}"
       );
-   }
-
-   #[test]
-   fn test_decode_request_body_unknown_encoding_treated_as_utf8() {
-      let body = decode_request_body("hello", Some("unknown")).unwrap();
-
-      assert_eq!(body, b"hello");
    }
 
    // --- InFlightRequests / abort tests ---
@@ -1049,9 +979,9 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/a"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert!(resp.redirected);
-      assert_eq!(resp.body, "ok");
+      assert_eq!(resp.metadata.status, 200);
+      assert!(resp.metadata.redirected);
+      assert_eq!(resp.body, b"ok");
    }
 
    #[tokio::test]
@@ -1105,9 +1035,9 @@ mod tests {
 
       // With max_redirects=3, the 4th redirect is stopped and the 3xx is returned
       assert!(
-         resp.status >= 300 && resp.status < 400,
+         resp.metadata.status >= 300 && resp.metadata.status < 400,
          "should return redirect status when max hops exceeded, got: {}",
-         resp.status
+         resp.metadata.status
       );
    }
 
@@ -1133,9 +1063,9 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/start"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert_eq!(resp.body, "final");
-      assert!(resp.redirected);
+      assert_eq!(resp.metadata.status, 200);
+      assert_eq!(resp.body, b"final");
+      assert!(resp.metadata.redirected);
    }
 
    #[tokio::test]
@@ -1155,8 +1085,8 @@ mod tests {
       let resp = state.execute(req).await.unwrap();
 
       // With max_redirects=0, the redirect is not followed
-      assert!(resp.status >= 300 && resp.status < 400);
-      assert!(!resp.redirected);
+      assert!(resp.metadata.status >= 300 && resp.metadata.status < 400);
+      assert!(!resp.metadata.redirected);
    }
 
    // --- Body size limit tests ---
@@ -1652,15 +1582,16 @@ mod tests {
    #[test]
    fn test_calculate_backoff_with_retry_after_header() {
       let config = RetryConfig::default();
-      let resp = FetchResponse {
-         status: 429,
-         status_text: "Too Many Requests".to_string(),
-         headers: HashMap::from([("retry-after".to_string(), vec!["5".to_string()])]),
-         body: String::new(),
-         body_encoding: "utf8".to_string(),
-         url: "https://example.com".to_string(),
-         redirected: false,
-         retry_count: 0,
+      let resp = ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: 429,
+            status_text: "Too Many Requests".to_string(),
+            headers: HashMap::from([("retry-after".to_string(), vec!["5".to_string()])]),
+            url: "https://example.com".to_string(),
+            redirected: false,
+            retry_count: 0,
+         },
+         body: Vec::new(),
       };
 
       let backoff = calculate_backoff(&config, 1, Some(&Ok(resp)));
@@ -1674,15 +1605,16 @@ mod tests {
          max_retry_after: Duration::from_secs(10),
          ..RetryConfig::default()
       };
-      let resp = FetchResponse {
-         status: 429,
-         status_text: "Too Many Requests".to_string(),
-         headers: HashMap::from([("retry-after".to_string(), vec!["999".to_string()])]),
-         body: String::new(),
-         body_encoding: "utf8".to_string(),
-         url: "https://example.com".to_string(),
-         redirected: false,
-         retry_count: 0,
+      let resp = ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: 429,
+            status_text: "Too Many Requests".to_string(),
+            headers: HashMap::from([("retry-after".to_string(), vec!["999".to_string()])]),
+            url: "https://example.com".to_string(),
+            redirected: false,
+            retry_count: 0,
+         },
+         body: Vec::new(),
       };
 
       let backoff = calculate_backoff(&config, 1, Some(&Ok(resp)));
@@ -1692,15 +1624,16 @@ mod tests {
 
    #[test]
    fn test_parse_retry_after_valid_seconds() {
-      let resp = FetchResponse {
-         status: 429,
-         status_text: "Too Many Requests".to_string(),
-         headers: HashMap::from([("retry-after".to_string(), vec!["120".to_string()])]),
-         body: String::new(),
-         body_encoding: "utf8".to_string(),
-         url: "https://example.com".to_string(),
-         redirected: false,
-         retry_count: 0,
+      let resp = ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: 429,
+            status_text: "Too Many Requests".to_string(),
+            headers: HashMap::from([("retry-after".to_string(), vec!["120".to_string()])]),
+            url: "https://example.com".to_string(),
+            redirected: false,
+            retry_count: 0,
+         },
+         body: Vec::new(),
       };
 
       assert_eq!(
@@ -1711,15 +1644,16 @@ mod tests {
 
    #[test]
    fn test_parse_retry_after_missing_header() {
-      let resp = FetchResponse {
-         status: 503,
-         status_text: "Service Unavailable".to_string(),
-         headers: HashMap::new(),
-         body: String::new(),
-         body_encoding: "utf8".to_string(),
-         url: "https://example.com".to_string(),
-         redirected: false,
-         retry_count: 0,
+      let resp = ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: 503,
+            status_text: "Service Unavailable".to_string(),
+            headers: HashMap::new(),
+            url: "https://example.com".to_string(),
+            redirected: false,
+            retry_count: 0,
+         },
+         body: Vec::new(),
       };
 
       assert_eq!(parse_retry_after_from_response(&resp), None);
@@ -1727,18 +1661,19 @@ mod tests {
 
    #[test]
    fn test_parse_retry_after_non_numeric_ignored() {
-      let resp = FetchResponse {
-         status: 429,
-         status_text: "Too Many Requests".to_string(),
-         headers: HashMap::from([(
-            "retry-after".to_string(),
-            vec!["Wed, 21 Oct 2025 07:28:00 GMT".to_string()],
-         )]),
-         body: String::new(),
-         body_encoding: "utf8".to_string(),
-         url: "https://example.com".to_string(),
-         redirected: false,
-         retry_count: 0,
+      let resp = ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: 429,
+            status_text: "Too Many Requests".to_string(),
+            headers: HashMap::from([(
+               "retry-after".to_string(),
+               vec!["Wed, 21 Oct 2025 07:28:00 GMT".to_string()],
+            )]),
+            url: "https://example.com".to_string(),
+            redirected: false,
+            retry_count: 0,
+         },
+         body: Vec::new(),
       };
 
       assert_eq!(parse_retry_after_from_response(&resp), None);
@@ -1746,15 +1681,16 @@ mod tests {
 
    #[test]
    fn test_parse_retry_after_zero_seconds() {
-      let resp = FetchResponse {
-         status: 429,
-         status_text: "Too Many Requests".to_string(),
-         headers: HashMap::from([("retry-after".to_string(), vec!["0".to_string()])]),
-         body: String::new(),
-         body_encoding: "utf8".to_string(),
-         url: "https://example.com".to_string(),
-         redirected: false,
-         retry_count: 0,
+      let resp = ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: 429,
+            status_text: "Too Many Requests".to_string(),
+            headers: HashMap::from([("retry-after".to_string(), vec!["0".to_string()])]),
+            url: "https://example.com".to_string(),
+            redirected: false,
+            retry_count: 0,
+         },
+         body: Vec::new(),
       };
 
       assert_eq!(
@@ -1766,15 +1702,16 @@ mod tests {
    #[test]
    fn test_calculate_backoff_with_retry_after_zero() {
       let config = RetryConfig::default();
-      let resp = FetchResponse {
-         status: 429,
-         status_text: "Too Many Requests".to_string(),
-         headers: HashMap::from([("retry-after".to_string(), vec!["0".to_string()])]),
-         body: String::new(),
-         body_encoding: "utf8".to_string(),
-         url: "https://example.com".to_string(),
-         redirected: false,
-         retry_count: 0,
+      let resp = ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: 429,
+            status_text: "Too Many Requests".to_string(),
+            headers: HashMap::from([("retry-after".to_string(), vec!["0".to_string()])]),
+            url: "https://example.com".to_string(),
+            redirected: false,
+            retry_count: 0,
+         },
+         body: Vec::new(),
       };
 
       let backoff = calculate_backoff(&config, 1, Some(&Ok(resp)));
@@ -1829,9 +1766,9 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert_eq!(resp.body, "ok");
-      assert_eq!(resp.retry_count, 1);
+      assert_eq!(resp.metadata.status, 200);
+      assert_eq!(resp.body, b"ok");
+      assert_eq!(resp.metadata.retry_count, 1);
    }
 
    #[tokio::test]
@@ -1860,8 +1797,8 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 503);
-      assert_eq!(resp.retry_count, 2);
+      assert_eq!(resp.metadata.status, 503);
+      assert_eq!(resp.metadata.retry_count, 2);
    }
 
    #[tokio::test]
@@ -1891,8 +1828,8 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 500);
-      assert_eq!(resp.retry_count, 0);
+      assert_eq!(resp.metadata.status, 500);
+      assert_eq!(resp.metadata.retry_count, 0);
    }
 
    #[tokio::test]
@@ -1911,8 +1848,8 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 503);
-      assert_eq!(resp.retry_count, 0);
+      assert_eq!(resp.metadata.status, 503);
+      assert_eq!(resp.metadata.retry_count, 0);
    }
 
    // --- Full execute() pipeline tests ---
@@ -1939,12 +1876,11 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/data"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert_eq!(resp.status_text, "OK");
-      assert_eq!(resp.body, r#"{"hello":"world"}"#);
-      assert_eq!(resp.body_encoding, "utf8");
-      assert!(!resp.redirected);
-      assert_eq!(resp.retry_count, 0);
+      assert_eq!(resp.metadata.status, 200);
+      assert_eq!(resp.metadata.status_text, "OK");
+      assert_eq!(resp.body, br#"{"hello":"world"}"#);
+      assert!(!resp.metadata.redirected);
+      assert_eq!(resp.metadata.retry_count, 0);
    }
 
    #[tokio::test]
@@ -1968,7 +1904,7 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
+      assert_eq!(resp.metadata.status, 200);
    }
 
    #[tokio::test]
@@ -2022,7 +1958,7 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/api"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
+      assert_eq!(resp.metadata.status, 200);
    }
 
    #[tokio::test]
@@ -2053,7 +1989,7 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
+      assert_eq!(resp.metadata.status, 200);
    }
 
    #[tokio::test]
@@ -2074,8 +2010,7 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/text"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.body, "plain text response");
-      assert_eq!(resp.body_encoding, "utf8");
+      assert_eq!(resp.body, b"plain text response");
    }
 
    #[tokio::test]
@@ -2097,14 +2032,8 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/image"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.body_encoding, "base64");
-
-      // Decode and verify
-      let decoded = base64::engine::general_purpose::STANDARD
-         .decode(&resp.body)
-         .unwrap();
-
-      assert_eq!(decoded, binary_data);
+      // Body is now raw bytes (no base64 encoding at the execute layer)
+      assert_eq!(resp.body, binary_data);
    }
 
    #[tokio::test]
@@ -2123,12 +2052,12 @@ mod tests {
 
       req.method = Some("POST".to_string());
       req.body = Some(r#"{"key":"value"}"#.to_string());
-      req.body_encoding = Some("utf8".to_string());
+      req.body_encoding = Some(BodyEncoding::Utf8);
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 201);
-      assert_eq!(resp.body, "created");
+      assert_eq!(resp.metadata.status, 201);
+      assert_eq!(resp.body, b"created");
    }
 
    #[tokio::test]
@@ -2149,7 +2078,7 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/headers"));
       let resp = state.execute(req).await.unwrap();
 
-      let custom_header = resp.headers.get("x-custom-response").unwrap();
+      let custom_header = resp.metadata.headers.get("x-custom-response").unwrap();
 
       assert_eq!(custom_header, &vec!["header-value".to_string()]);
    }
@@ -2212,9 +2141,9 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/a"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert!(resp.redirected);
-      assert!(resp.url.contains("/b"));
+      assert_eq!(resp.metadata.status, 200);
+      assert!(resp.metadata.redirected);
+      assert!(resp.metadata.url.contains("/b"));
    }
 
    #[tokio::test]
@@ -2231,7 +2160,7 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/direct"));
       let resp = state.execute(req).await.unwrap();
 
-      assert!(!resp.redirected);
+      assert!(!resp.metadata.redirected);
    }
 
    #[tokio::test]
@@ -2250,15 +2179,15 @@ mod tests {
 
       req.method = Some("POST".to_string());
       req.body = Some(String::new());
-      req.body_encoding = Some("utf8".to_string());
+      req.body_encoding = Some(BodyEncoding::Utf8);
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
+      assert_eq!(resp.metadata.status, 200);
    }
 
    #[tokio::test]
-   async fn test_execute_from_utf8_lossy_on_binary_with_text_content_type() {
+   async fn test_execute_returns_raw_bytes_for_invalid_utf8() {
       let server = MockServer::start().await;
 
       // Send binary data (invalid UTF-8) with text/plain content type
@@ -2268,7 +2197,7 @@ mod tests {
          .and(path("/lossy"))
          .respond_with(
             ResponseTemplate::new(200)
-               .set_body_bytes(binary_body)
+               .set_body_bytes(binary_body.clone())
                .insert_header("Content-Type", "text/plain"),
          )
          .mount(&server)
@@ -2278,13 +2207,8 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/lossy"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.body_encoding, "utf8");
-      // The invalid byte 0xFF should be replaced with U+FFFD
-      assert!(
-         resp.body.contains('\u{FFFD}'),
-         "expected replacement character in lossy UTF-8 conversion, got: {:?}",
-         resp.body
-      );
+      // Body is raw bytes — no lossy UTF-8 conversion at the execute layer
+      assert_eq!(resp.body, binary_body);
    }
 
    #[tokio::test]
@@ -2326,9 +2250,9 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert_eq!(resp.body, "fast");
-      assert_eq!(resp.retry_count, 1);
+      assert_eq!(resp.metadata.status, 200);
+      assert_eq!(resp.body, b"fast");
+      assert_eq!(resp.metadata.retry_count, 1);
    }
 
    #[tokio::test]
@@ -2364,8 +2288,8 @@ mod tests {
 
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert_eq!(resp.retry_count, 1);
+      assert_eq!(resp.metadata.status, 200);
+      assert_eq!(resp.metadata.retry_count, 1);
    }
 
    #[tokio::test]
@@ -2417,8 +2341,8 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/api"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert_eq!(resp.retry_count, 1);
+      assert_eq!(resp.metadata.status, 200);
+      assert_eq!(resp.metadata.retry_count, 1);
    }
 
    // --- Redirect to IP address (integration) ---
@@ -2483,11 +2407,11 @@ mod tests {
 
       // Should get the 3xx response (stop behavior), not an error
       assert!(
-         resp.status >= 300 && resp.status < 400,
+         resp.metadata.status >= 300 && resp.metadata.status < 400,
          "expected 3xx status from stop(), got {}",
-         resp.status
+         resp.metadata.status
       );
-      assert!(resp.redirected);
+      assert!(resp.metadata.redirected);
    }
 
    // --- Retry-After end-to-end ---
@@ -2527,8 +2451,8 @@ mod tests {
       let req = make_request(&localhost_url(&server, "/rate-limited"));
       let resp = state.execute(req).await.unwrap();
 
-      assert_eq!(resp.status, 200);
-      assert_eq!(resp.retry_count, 1);
+      assert_eq!(resp.metadata.status, 200);
+      assert_eq!(resp.metadata.retry_count, 1);
    }
 
    // --- Per-request max_retries override ---
@@ -2570,8 +2494,8 @@ mod tests {
 
       // With max_retries=1, we get 2 attempts: first returns 500, second returns 500.
       // Since retries are exhausted, we get the last 500 response.
-      assert_eq!(resp.status, 500);
-      assert_eq!(resp.retry_count, 1);
+      assert_eq!(resp.metadata.status, 500);
+      assert_eq!(resp.metadata.retry_count, 1);
    }
 
    // --- Security errors skip retry loop ---

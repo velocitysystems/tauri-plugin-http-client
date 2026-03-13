@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { HttpHeaders } from './headers';
-import { parseError } from './errors';
-import type { BodyEncoding, RequestOptions, HttpResponse, RawFetchRequest, RawFetchResponse } from './types';
+import { HttpClientError, HttpErrorCode, parseError } from './errors';
+import type { BodyEncoding, RequestOptions, HttpResponse, RawFetchRequest, FetchResponseMetadata } from './types';
 
 let requestCounter = 0;
 
@@ -46,9 +46,9 @@ export async function request(url: string, options?: RequestOptions): Promise<Ht
 
    try {
       const payload = buildPayload(url, requestId, options),
-            raw: RawFetchResponse = await invoke('plugin:http-client|fetch', { request: payload });
+            ipcResult: ArrayBuffer | number[] = await invoke('plugin:http-client|fetch', { request: payload });
 
-      return wrapResponse(raw);
+      return wrapResponse(decodeIpcResult(ipcResult));
    } catch(err: unknown) {
       throw parseError(err);
    } finally {
@@ -119,42 +119,126 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
    return btoa(binary);
 }
 
-function base64ToUint8Array(base64: string): Uint8Array {
-   const binary = atob(base64),
-         bytes = new Uint8Array(binary.length);
-
-   for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-   }
-
-   return bytes;
+/**
+ * Normalized shape produced by `decodeIpcResult` — metadata plus raw body bytes.
+ * This is the internal representation used by `wrapResponse`.
+ */
+interface DecodedResponse {
+   metadata: FetchResponseMetadata;
+   body: Uint8Array;
 }
 
-function wrapResponse(raw: RawFetchResponse): HttpResponse {
-   const headers = new HttpHeaders(raw.headers);
+/**
+ * Decodes the raw value returned by `invoke('plugin:http-client|fetch')` into
+ * a unified `DecodedResponse`.
+ *
+ * The binary frame format is:
+ * `[4-byte BE metadata length][metadata JSON bytes][body bytes]`
+ *
+ * Tauri delivers `InvokeResponseBody::Raw` as an `ArrayBuffer` on most
+ * platforms. On some platforms (notably Android), raw bytes may arrive as a
+ * `number[]` instead; this function normalizes both forms before decoding.
+ */
+export function decodeIpcResult(result: ArrayBuffer | number[]): DecodedResponse {
+   // Tauri may deliver raw bytes as a number[] instead of ArrayBuffer on some
+   // platforms. Normalize to ArrayBuffer before decoding the binary frame.
+   const buf: ArrayBuffer = result instanceof ArrayBuffer
+      ? result
+      : new Uint8Array(result as number[]).buffer;
+
+   return decodeBinaryFrame(buf);
+}
+
+function isValidFetchMetadata(val: unknown): val is FetchResponseMetadata {
+   if (val === null || typeof val !== 'object') {
+      return false;
+   }
+
+   const o = val as Record<string, unknown>;
+
+   return typeof o.status === 'number'
+      && typeof o.statusText === 'string'
+      && typeof o.headers === 'object' && o.headers !== null
+      && typeof o.url === 'string'
+      && typeof o.redirected === 'boolean'
+      && typeof o.retryCount === 'number';
+}
+
+/**
+ * Decodes the binary frame format used on desktop platforms:
+ * `[4-byte BE metadata length][metadata JSON bytes][body bytes]`
+ *
+ * Throws `HttpClientError` with code `PROTOCOL_ERROR` if the frame is
+ * malformed (truncated, invalid UTF-8 metadata, invalid JSON, or missing
+ * required fields).
+ */
+function decodeBinaryFrame(buf: ArrayBuffer): DecodedResponse {
+   if (buf.byteLength < 4) {
+      throw new HttpClientError(HttpErrorCode.PROTOCOL_ERROR, `binary frame too small: ${buf.byteLength} bytes`);
+   }
+
+   const view = new DataView(buf),
+         metaLen = view.getUint32(0);
+
+   if (metaLen === 0) {
+      throw new HttpClientError(HttpErrorCode.PROTOCOL_ERROR, 'binary frame metadata length is 0');
+   }
+
+   if (4 + metaLen > buf.byteLength) {
+      throw new HttpClientError(
+         HttpErrorCode.PROTOCOL_ERROR,
+         `binary frame metadata length ${metaLen} exceeds buffer size ${buf.byteLength}`
+      );
+   }
+
+   const metaBytes = new Uint8Array(buf, 4, metaLen);
+
+   let metaJson: string;
+
+   try {
+      metaJson = new TextDecoder('utf-8', { fatal: true }).decode(metaBytes);
+   } catch{
+      throw new HttpClientError(HttpErrorCode.PROTOCOL_ERROR, 'binary frame metadata is not valid UTF-8');
+   }
+
+   let parsed: unknown;
+
+   try {
+      parsed = JSON.parse(metaJson);
+   } catch{
+      throw new HttpClientError(HttpErrorCode.PROTOCOL_ERROR, 'binary frame metadata is not valid JSON');
+   }
+
+   if (!isValidFetchMetadata(parsed)) {
+      throw new HttpClientError(HttpErrorCode.PROTOCOL_ERROR, 'binary frame metadata is missing required fields');
+   }
+
+   const metadata = parsed as FetchResponseMetadata,
+         body = new Uint8Array(buf, 4 + metaLen);
+
+   return { metadata, body };
+}
+
+function wrapResponse(decoded: DecodedResponse): HttpResponse {
+   const { metadata, body } = decoded,
+         headers = new HttpHeaders(metadata.headers);
 
    // Cache decoded body values
    let textValue: string | undefined,
        bytesValue: Uint8Array | undefined;
 
    return {
-      status: raw.status,
-      statusText: raw.statusText,
+      status: metadata.status,
+      statusText: metadata.statusText,
       headers,
-      url: raw.url,
-      redirected: raw.redirected,
-      ok: raw.status >= 200 && raw.status < 300, // mirrors fetch() Response.ok
-      retryCount: raw.retryCount,
+      url: metadata.url,
+      redirected: metadata.redirected,
+      ok: metadata.status >= 200 && metadata.status < 300, // mirrors fetch() Response.ok
+      retryCount: metadata.retryCount,
 
       text(): string {
          if (textValue === undefined) {
-            if (raw.bodyEncoding === 'base64') {
-               const bytes = base64ToUint8Array(raw.body);
-
-               textValue = new TextDecoder().decode(bytes);
-            } else {
-               textValue = raw.body;
-            }
+            textValue = new TextDecoder().decode(body);
          }
 
          return textValue;
@@ -166,11 +250,8 @@ function wrapResponse(raw: RawFetchResponse): HttpResponse {
 
       bytes(): Uint8Array {
          if (bytesValue === undefined) {
-            if (raw.bodyEncoding === 'base64') {
-               bytesValue = base64ToUint8Array(raw.body);
-            } else {
-               bytesValue = new TextEncoder().encode(raw.body);
-            }
+            // Slice to own a non-shared copy (body is a view into the IPC buffer)
+            bytesValue = body.slice();
          }
 
          return bytesValue;

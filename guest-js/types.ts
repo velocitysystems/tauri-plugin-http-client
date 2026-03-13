@@ -31,13 +31,15 @@ export interface HttpResponse {
    bytes(): Uint8Array;
 }
 
-/** Raw IPC response from the Rust backend. */
-export interface RawFetchResponse {
+/**
+ * Response metadata from the Rust backend, carried in the binary frame header.
+ * Field names match the camelCase serialization of `FetchResponseMetadata` in
+ * Rust's `types.rs`.
+ */
+export interface FetchResponseMetadata {
    status: number;
    statusText: string;
    headers: Record<string, string[]>;
-   body: string;
-   bodyEncoding: BodyEncoding;
    url: string;
    redirected: boolean;
    retryCount: number;

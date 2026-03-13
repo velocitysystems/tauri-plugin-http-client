@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { RawFetchResponse } from './types';
+import type { FetchResponseMetadata } from './types';
 import type { HttpClientError as HttpClientErrorType } from './errors';
 
 // Mock @tauri-apps/api/core before importing the module under test
@@ -10,24 +10,42 @@ vi.mock('@tauri-apps/api/core', () => {
 });
 
 // Import after mock setup
-const { request } = await import('./http-client');
+const { request, decodeIpcResult } = await import('./http-client');
 
 const { HttpClientError, HttpErrorCode } = await import('./errors');
 
 const { HttpHeaders } = await import('./headers');
 
-function makeRawResponse(overrides?: Partial<RawFetchResponse>): RawFetchResponse {
-   return {
+// ---- helpers ----------------------------------------------------------------
+
+/**
+ * Builds a binary-framed ArrayBuffer matching the IPC format:
+ * [4-byte BE metadata length][metadata JSON][body bytes]
+ */
+function makeBinaryFrame(metadata: Partial<FetchResponseMetadata>, bodyText: string): ArrayBuffer;
+function makeBinaryFrame(metadata: Partial<FetchResponseMetadata>, bodyBytes: Uint8Array): ArrayBuffer;
+function makeBinaryFrame(metadata: Partial<FetchResponseMetadata>, body: string | Uint8Array): ArrayBuffer {
+   const meta: FetchResponseMetadata = {
       status: 200,
       statusText: 'OK',
       headers: { 'content-type': [ 'application/json' ] },
-      body: '{"key":"value"}',
-      bodyEncoding: 'utf8',
       url: 'https://api.example.com/data',
       redirected: false,
       retryCount: 0,
-      ...overrides,
+      ...metadata,
    };
+
+   const metaBytes = new TextEncoder().encode(JSON.stringify(meta)),
+         bodyBytes = typeof body === 'string' ? new TextEncoder().encode(body) : body,
+         buf = new ArrayBuffer(4 + metaBytes.length + bodyBytes.length),
+         view = new DataView(buf),
+         u8 = new Uint8Array(buf);
+
+   view.setUint32(0, metaBytes.length);
+   u8.set(metaBytes, 4);
+   u8.set(bodyBytes, 4 + metaBytes.length);
+
+   return buf;
 }
 
 describe('request()', () => {
@@ -41,9 +59,7 @@ describe('request()', () => {
    });
 
    it('sends a basic GET request and returns a response', async () => {
-      const raw = makeRawResponse();
-
-      mockInvoke.mockResolvedValueOnce(raw);
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, '{"key":"value"}'));
 
       const resp = await request('https://api.example.com/data');
 
@@ -59,7 +75,7 @@ describe('request()', () => {
    });
 
    it('returns text body correctly', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ body: 'hello world', bodyEncoding: 'utf8' }));
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, 'hello world'));
 
       const resp = await request('https://example.com');
 
@@ -67,7 +83,7 @@ describe('request()', () => {
    });
 
    it('parses JSON body correctly', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, '{"key":"value"}'));
 
       const resp = await request('https://example.com'),
             data = resp.json<{ key: string }>();
@@ -75,9 +91,8 @@ describe('request()', () => {
       expect(data.key).toBe('value');
    });
 
-   it('decodes base64 body to bytes', async () => {
-      // "hello" in base64
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ body: 'aGVsbG8=', bodyEncoding: 'base64' }));
+   it('decodes binary body to bytes', async () => {
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, new Uint8Array([ 0x68, 0x65, 0x6C, 0x6C, 0x6F ])));
 
       const resp = await request('https://example.com'),
             bytes = resp.bytes();
@@ -87,7 +102,7 @@ describe('request()', () => {
    });
 
    it('sends POST with string body', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com', { method: 'POST', body: 'payload' });
 
@@ -99,7 +114,7 @@ describe('request()', () => {
    });
 
    it('sends POST with object body as JSON', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com', { method: 'POST', body: { foo: 'bar' } });
 
@@ -110,7 +125,7 @@ describe('request()', () => {
    });
 
    it('sends POST with Uint8Array body as base64', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       // Construct Uint8Array directly (not via TextEncoder) to avoid
       // cross-realm instanceof issues in jsdom test environment.
@@ -126,7 +141,7 @@ describe('request()', () => {
    });
 
    it('sends headers from Record', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com', {
          headers: { 'Authorization': 'Bearer token' },
@@ -138,7 +153,7 @@ describe('request()', () => {
    });
 
    it('sends headers from HttpHeaders instance', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       const headers = new HttpHeaders();
 
@@ -152,7 +167,7 @@ describe('request()', () => {
    });
 
    it('sends timeout', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com', { timeout: 5000 });
 
@@ -162,7 +177,7 @@ describe('request()', () => {
    });
 
    it('ok is false for non-2xx status', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ status: 404, statusText: 'Not Found' }));
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({ status: 404, statusText: 'Not Found' }, ''));
 
       const resp = await request('https://example.com');
 
@@ -200,7 +215,7 @@ describe('request()', () => {
    });
 
    it('includes requestId when signal is provided', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       const controller = new AbortController();
 
@@ -214,9 +229,9 @@ describe('request()', () => {
 
    it('calls abort_request when signal fires', async () => {
       // Make invoke hang until we abort
-      let resolveInvoke: ((v: RawFetchResponse) => void) | undefined;
+      let resolveInvoke: ((v: ArrayBuffer) => void) | undefined;
 
-      const invokePromise = new Promise<RawFetchResponse>((resolve) => {
+      const invokePromise = new Promise<ArrayBuffer>((resolve) => {
          resolveInvoke = resolve;
       });
 
@@ -236,7 +251,7 @@ describe('request()', () => {
 
       // Resolve the fetch so the promise settles
       if (resolveInvoke) {
-         resolveInvoke(makeRawResponse());
+         resolveInvoke(makeBinaryFrame({}, ''));
       }
 
       const resp = await reqPromise;
@@ -251,20 +266,16 @@ describe('request()', () => {
       expect(abortCall).toBeDefined();
    });
 
-   it('decodes base64 body to text via text()', async () => {
-      // "héllo" in UTF-8 then base64
-      const bytes = new TextEncoder().encode('héllo'),
-            b64 = btoa(String.fromCharCode(...bytes));
-
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ body: b64, bodyEncoding: 'base64' }));
+   it('decodes non-ASCII body to text via text()', async () => {
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, new TextEncoder().encode('héllo')));
 
       const resp = await request('https://example.com');
 
       expect(resp.text()).toBe('héllo');
    });
 
-   it('converts utf8 body to bytes via bytes()', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ body: 'hello', bodyEncoding: 'utf8' }));
+   it('converts body to bytes via bytes()', async () => {
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, 'hello'));
 
       const resp = await request('https://example.com'),
             bytes = resp.bytes();
@@ -274,7 +285,7 @@ describe('request()', () => {
    });
 
    it('caches text() return value', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ body: 'cached', bodyEncoding: 'utf8' }));
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, 'cached'));
 
       const resp = await request('https://example.com');
 
@@ -284,7 +295,7 @@ describe('request()', () => {
    });
 
    it('caches bytes() return value', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ body: 'aGVsbG8=', bodyEncoding: 'base64' }));
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, 'hello'));
 
       const resp = await request('https://example.com');
 
@@ -296,7 +307,7 @@ describe('request()', () => {
    });
 
    it('removes abort listener after successful request', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       const controller = new AbortController(),
             removeSpy = vi.spyOn(controller.signal, 'removeEventListener');
@@ -307,7 +318,7 @@ describe('request()', () => {
    });
 
    it('does not include requestId without signal', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com');
 
@@ -317,7 +328,7 @@ describe('request()', () => {
    });
 
    it('omits undefined optional fields from payload', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com');
 
@@ -328,7 +339,7 @@ describe('request()', () => {
 
    it('ok boundary: 199 is not ok, 200 is ok, 299 is ok, 300 is not ok', async () => {
       for (const [ status, expectedOk ] of [ [ 199, false ], [ 200, true ], [ 299, true ], [ 300, false ] ] as [number, boolean][]) {
-         mockInvoke.mockResolvedValueOnce(makeRawResponse({ status }));
+         mockInvoke.mockResolvedValueOnce(makeBinaryFrame({ status }, ''));
 
          const resp = await request('https://example.com');
 
@@ -337,10 +348,10 @@ describe('request()', () => {
    });
 
    it('handles redirected response', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({
          redirected: true,
          url: 'https://api.example.com/final',
-      }));
+      }, ''));
 
       const resp = await request('https://api.example.com/start');
 
@@ -349,7 +360,7 @@ describe('request()', () => {
    });
 
    it('passes maxRetries in payload', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com', { maxRetries: 5 });
 
@@ -359,7 +370,7 @@ describe('request()', () => {
    });
 
    it('omits maxRetries when undefined', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com');
 
@@ -369,7 +380,7 @@ describe('request()', () => {
    });
 
    it('exposes retryCount from response', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ retryCount: 2 }));
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({ retryCount: 2 }, ''));
 
       const resp = await request('https://example.com');
 
@@ -377,7 +388,7 @@ describe('request()', () => {
    });
 
    it('retryCount is 0 when no retries occurred', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       const resp = await request('https://example.com');
 
@@ -385,7 +396,7 @@ describe('request()', () => {
    });
 
    it('sends empty string body correctly', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       await request('https://example.com', { method: 'POST', body: '' });
 
@@ -396,7 +407,7 @@ describe('request()', () => {
    });
 
    it('sends multi-value headers via HttpHeaders as comma-joined string', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse());
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
       const headers = new HttpHeaders();
 
@@ -416,7 +427,7 @@ describe('request()', () => {
 
       // Fire 10 rapid requests, each generating a unique requestId
       for (let i = 0; i < 10; i++) {
-         mockInvoke.mockResolvedValueOnce(makeRawResponse());
+         mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, ''));
 
          const controller = new AbortController();
 
@@ -432,13 +443,283 @@ describe('request()', () => {
    });
 
    it('json() throws on invalid JSON body', async () => {
-      mockInvoke.mockResolvedValueOnce(makeRawResponse({ body: 'not valid json', bodyEncoding: 'utf8' }));
+      mockInvoke.mockResolvedValueOnce(makeBinaryFrame({}, 'not valid json'));
 
       const resp = await request('https://example.com');
 
       const fn = (): unknown => { return resp.json(); };
 
       expect(fn).toThrow();
+   });
+
+   // ---- binary frame path --------------------------------------------------
+
+   it('decodes binary frame: basic status, headers, text body', async () => {
+      const buf = makeBinaryFrame(
+         { status: 200, statusText: 'OK', headers: { 'content-type': [ 'text/plain' ] }, url: 'https://example.com', redirected: false, retryCount: 0 },
+         'hello binary'
+      );
+
+      mockInvoke.mockResolvedValueOnce(buf);
+
+      const resp = await request('https://example.com');
+
+      expect(resp.status).toBe(200);
+      expect(resp.statusText).toBe('OK');
+      expect(resp.ok).toBe(true);
+      expect(resp.url).toBe('https://example.com');
+      expect(resp.redirected).toBe(false);
+      expect(resp.headers.get('content-type')).toBe('text/plain');
+      expect(resp.text()).toBe('hello binary');
+   });
+
+   it('decodes binary frame: binary body via bytes()', async () => {
+      const binaryBody = new Uint8Array([ 0x89, 0x50, 0x4E, 0x47 ]),
+            buf = makeBinaryFrame({ status: 200, statusText: 'OK', headers: {}, url: 'https://example.com', redirected: false, retryCount: 0 }, binaryBody);
+
+      mockInvoke.mockResolvedValueOnce(buf);
+
+      const resp = await request('https://example.com'),
+            bytes = resp.bytes();
+
+      expect(bytes).toBeInstanceOf(Uint8Array);
+      expect(Array.from(bytes)).toEqual([ 0x89, 0x50, 0x4E, 0x47 ]);
+   });
+
+   it('decodes binary frame: empty body', async () => {
+      const buf = makeBinaryFrame({ status: 204, statusText: 'No Content', headers: {}, url: 'https://example.com', redirected: false, retryCount: 0 }, '');
+
+      mockInvoke.mockResolvedValueOnce(buf);
+
+      const resp = await request('https://example.com');
+
+      expect(resp.status).toBe(204);
+      expect(resp.text()).toBe('');
+      expect(resp.bytes().length).toBe(0);
+   });
+
+   it('decodes binary frame: retryCount and redirected flags', async () => {
+      const buf = makeBinaryFrame(
+         { status: 200, statusText: 'OK', headers: {}, url: 'https://example.com/final', redirected: true, retryCount: 2 },
+         'body'
+      );
+
+      mockInvoke.mockResolvedValueOnce(buf);
+
+      const resp = await request('https://example.com');
+
+      expect(resp.retryCount).toBe(2);
+      expect(resp.redirected).toBe(true);
+      expect(resp.url).toBe('https://example.com/final');
+   });
+
+   it('decodes binary frame: multi-value headers', async () => {
+      const buf = makeBinaryFrame(
+         { status: 200, statusText: 'OK', headers: { 'set-cookie': [ 'a=1', 'b=2' ] }, url: 'https://example.com', redirected: false, retryCount: 0 },
+         ''
+      );
+
+      mockInvoke.mockResolvedValueOnce(buf);
+
+      const resp = await request('https://example.com');
+
+      expect(resp.headers.getAll('set-cookie')).toEqual([ 'a=1', 'b=2' ]);
+   });
+
+   it('bytes() caches the result — subsequent calls return the same reference', async () => {
+      const buf = makeBinaryFrame({ status: 200, statusText: 'OK', headers: {}, url: 'https://example.com', redirected: false, retryCount: 0 }, 'hello');
+
+      mockInvoke.mockResolvedValueOnce(buf);
+
+      const resp = await request('https://example.com'),
+            first = resp.bytes();
+
+      first[0] = 0xFF;
+
+      const second = resp.bytes();
+
+      // second call returns the cached copy which was already mutated
+      expect(second[0]).toBe(0xFF);
+      // but both calls return the same reference (cached)
+      expect(first).toBe(second);
+   });
+
+});
+
+// ---- decodeIpcResult() unit tests -------------------------------------------
+
+describe('decodeIpcResult()', () => {
+
+   it('decodes a binary ArrayBuffer frame', () => {
+      const buf = makeBinaryFrame(
+         { status: 201, statusText: 'Created', headers: { 'x-id': [ '42' ] }, url: 'https://x.com', redirected: false, retryCount: 1 },
+         'created'
+      );
+
+      const decoded = decodeIpcResult(buf);
+
+      expect(decoded.metadata.status).toBe(201);
+      expect(decoded.metadata.statusText).toBe('Created');
+      expect(decoded.metadata.url).toBe('https://x.com');
+      expect(decoded.metadata.redirected).toBe(false);
+      expect(decoded.metadata.retryCount).toBe(1);
+      expect(decoded.metadata.headers['x-id']).toEqual([ '42' ]);
+      expect(new TextDecoder().decode(decoded.body)).toBe('created');
+   });
+
+   it('normalizes Android number-array to ArrayBuffer and decodes frame', () => {
+      const originalBuf = makeBinaryFrame(
+         { status: 200, statusText: 'OK', headers: {}, url: 'https://android.example.com', redirected: false, retryCount: 0 },
+         'android body'
+      );
+
+      // Simulate what Tauri delivers on Android ≥ 1 KB: number array
+      const numberArray = Array.from(new Uint8Array(originalBuf));
+
+      const decoded = decodeIpcResult(numberArray);
+
+      expect(decoded.metadata.status).toBe(200);
+      expect(decoded.metadata.url).toBe('https://android.example.com');
+      expect(new TextDecoder().decode(decoded.body)).toBe('android body');
+   });
+
+   it('binary frame: empty body', () => {
+      const buf = makeBinaryFrame({ status: 204, statusText: 'No Content', headers: {}, url: 'https://x.com', redirected: false, retryCount: 0 }, '');
+
+      const decoded = decodeIpcResult(buf);
+
+      expect(decoded.metadata.status).toBe(204);
+      expect(decoded.body.length).toBe(0);
+   });
+
+   it('binary frame: body containing arbitrary bytes including null bytes', () => {
+      const bodyBytes = new Uint8Array([ 0x00, 0x01, 0xFF, 0xFE, 0x00 ]),
+            buf = makeBinaryFrame({ status: 200, statusText: 'OK', headers: {}, url: 'https://x.com', redirected: false, retryCount: 0 }, bodyBytes);
+
+      const decoded = decodeIpcResult(buf);
+
+      expect(Array.from(decoded.body)).toEqual([ 0x00, 0x01, 0xFF, 0xFE, 0x00 ]);
+   });
+
+   // ---- parser error cases (PROTOCOL_ERROR) ------------------------------------
+
+   it('throws PROTOCOL_ERROR when buffer is less than 4 bytes', () => {
+      const buf = new ArrayBuffer(3);
+
+      expect(() => { return decodeIpcResult(buf); }).toThrow(expect.objectContaining({
+         code: HttpErrorCode.PROTOCOL_ERROR,
+      }));
+   });
+
+   it('throws PROTOCOL_ERROR when metadata length exceeds buffer', () => {
+      // Frame claims metaLen = 9999 but buffer is only 10 bytes
+      const buf = new ArrayBuffer(10),
+            view = new DataView(buf);
+
+      view.setUint32(0, 9999);
+
+      expect(() => { return decodeIpcResult(buf); }).toThrow(expect.objectContaining({
+         code: HttpErrorCode.PROTOCOL_ERROR,
+      }));
+   });
+
+   it('throws PROTOCOL_ERROR when metadata length is 0', () => {
+      const buf = new ArrayBuffer(8),
+            view = new DataView(buf);
+
+      view.setUint32(0, 0);
+
+      expect(() => { return decodeIpcResult(buf); }).toThrow(expect.objectContaining({
+         code: HttpErrorCode.PROTOCOL_ERROR,
+      }));
+   });
+
+   it('throws PROTOCOL_ERROR when metadata bytes are invalid UTF-8', () => {
+      // 4-byte header + 4 bytes of invalid UTF-8 sequence
+      const buf = new ArrayBuffer(8),
+            view = new DataView(buf),
+            u8 = new Uint8Array(buf);
+
+      view.setUint32(0, 4);
+      // Lone continuation bytes — invalid UTF-8
+      u8[4] = 0x80;
+      u8[5] = 0x81;
+      u8[6] = 0x82;
+      u8[7] = 0x83;
+
+      expect(() => { return decodeIpcResult(buf); }).toThrow(expect.objectContaining({
+         code: HttpErrorCode.PROTOCOL_ERROR,
+      }));
+   });
+
+   it('throws PROTOCOL_ERROR when metadata is not valid JSON', () => {
+      const badJson = 'not { valid json',
+            badJsonBytes = new TextEncoder().encode(badJson),
+            buf = new ArrayBuffer(4 + badJsonBytes.length),
+            view = new DataView(buf),
+            u8 = new Uint8Array(buf);
+
+      view.setUint32(0, badJsonBytes.length);
+      u8.set(badJsonBytes, 4);
+
+      expect(() => { return decodeIpcResult(buf); }).toThrow(expect.objectContaining({
+         code: HttpErrorCode.PROTOCOL_ERROR,
+      }));
+   });
+
+   it('throws PROTOCOL_ERROR when metadata is missing required fields', () => {
+      const incompleteJson = JSON.stringify({ status: 200 }), // missing statusText, url, etc.
+            jsonBytes = new TextEncoder().encode(incompleteJson),
+            buf = new ArrayBuffer(4 + jsonBytes.length),
+            view = new DataView(buf),
+            u8 = new Uint8Array(buf);
+
+      view.setUint32(0, jsonBytes.length);
+      u8.set(jsonBytes, 4);
+
+      expect(() => { return decodeIpcResult(buf); }).toThrow(expect.objectContaining({
+         code: HttpErrorCode.PROTOCOL_ERROR,
+      }));
+   });
+
+   it('throws PROTOCOL_ERROR and request() wraps it as HttpClientError', async () => {
+      // Buffer too small — simulates a corrupted IPC response
+      const tinyBuf = new ArrayBuffer(2);
+
+      mockInvoke.mockResolvedValueOnce(tinyBuf);
+
+      try {
+         await request('https://example.com');
+         expect.fail('should have thrown');
+      } catch(err) {
+         expect(err).toBeInstanceOf(HttpClientError);
+         expect((err as HttpClientErrorType).code).toBe(HttpErrorCode.PROTOCOL_ERROR);
+      }
+   });
+
+   it('valid frame: does not throw (sanity check)', () => {
+      const buf = makeBinaryFrame(
+         { status: 200, statusText: 'OK', headers: {}, url: 'https://x.com', redirected: false, retryCount: 0 },
+         'hello'
+      );
+
+      // Sanity check: valid frame should NOT throw
+      expect(() => { return decodeIpcResult(buf); }).not.toThrow();
+   });
+
+   it('throws PROTOCOL_ERROR when metadata headers field is null', () => {
+      const metaJson = JSON.stringify({ status: 200, statusText: 'OK', headers: null, url: 'https://x.com', redirected: false, retryCount: 0 }),
+            metaBytes = new TextEncoder().encode(metaJson),
+            buf = new ArrayBuffer(4 + metaBytes.length),
+            view = new DataView(buf),
+            u8 = new Uint8Array(buf);
+
+      view.setUint32(0, metaBytes.length);
+      u8.set(metaBytes, 4);
+
+      expect(() => { return decodeIpcResult(buf); }).toThrow(expect.objectContaining({
+         code: HttpErrorCode.PROTOCOL_ERROR,
+      }));
    });
 
 });

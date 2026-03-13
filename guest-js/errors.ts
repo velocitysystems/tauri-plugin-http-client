@@ -48,6 +48,9 @@ export enum HttpErrorCode {
    /** A forbidden header was provided (e.g. Host). */
    FORBIDDEN_HEADER = 'FORBIDDEN_HEADER',
 
+   /** IPC response could not be decoded (malformed binary frame). */
+   PROTOCOL_ERROR = 'PROTOCOL_ERROR',
+
    /** Unclassified error. */
    ERROR = 'ERROR',
 
@@ -66,6 +69,8 @@ export class HttpClientError extends Error {
 
    public constructor(code: HttpErrorCode, message: string) {
       super(message);
+      // Required for instanceof when transpiled to ES5
+      Object.setPrototypeOf(this, new.target.prototype);
       this.name = 'HttpClientError';
       this.code = code;
    }

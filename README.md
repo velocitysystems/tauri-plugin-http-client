@@ -20,7 +20,7 @@ requests from Tauri applications.
    * Abort in-flight requests via `AbortController`
    * Case-insensitive `HttpHeaders` with multi-value
      support
-   * Binary request and response bodies (base64 over IPC)
+   * Binary request and response bodies
    * Runtime allowlist management from Rust
 
 
@@ -330,7 +330,6 @@ produce a `FORBIDDEN_HEADER` error.
 Full example:
 
 ```rust
-use std::collections::HashMap;
 use std::time::Duration;
 use tauri_plugin_http_client::config::RetryConfig;
 
@@ -343,10 +342,10 @@ let plugin = tauri_plugin_http_client::Builder::new()
    .max_redirects(5)
    .max_response_body_size(5 * 1024 * 1024)
    .max_allowlist_size(64)
-   .user_agent("my-app/1.0".into())
-   .default_headers(HashMap::from([
-      ("X-App-Version".into(), "1.0".into()),
-   ]))
+   .user_agent("my-app/1.0")
+   .default_headers([
+      ("X-App-Version", "1.0"),
+   ])
    .retry(RetryConfig::default())
    .build();
 ```
