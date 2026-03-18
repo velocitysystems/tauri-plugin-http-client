@@ -1,4 +1,5 @@
 import { request, HttpHeaders, HttpClientError } from '@silvermine/tauri-plugin-http-client';
+import { invoke } from '@tauri-apps/api/core';
 
 // --- Helpers ---
 
@@ -287,6 +288,37 @@ $('binary-fetch').addEventListener('click', async function() {
       output.appendChild(img);
    } catch(err) {
       clearElement(output);
+      setError(output, err);
+   } finally {
+      btn.disabled = false;
+   }
+});
+
+// --- Rust Backend Request ---
+
+$('rust-send').addEventListener('click', async function() {
+   const output = $('rust-output'),
+         btn = $('rust-send');
+
+   btn.disabled = true;
+   setLoading(output, 'Sending request via Rust backend');
+
+   try {
+      const resp = await invoke('fetch_from_rust', { url: $('rust-url').value });
+
+      setResult(output, JSON.stringify(
+         {
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: resp.headers,
+            url: resp.url,
+            redirected: resp.redirected,
+            body: tryParseJSON(resp.body),
+         },
+         null,
+         2,
+      ));
+   } catch(err) {
       setError(output, err);
    } finally {
       btn.disabled = false;

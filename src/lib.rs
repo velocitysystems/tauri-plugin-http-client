@@ -41,6 +41,8 @@ pub mod client;
 mod commands;
 pub mod config;
 pub mod error;
+pub mod request;
+pub mod response;
 pub mod types;
 
 use allowlist::DomainAllowlist;
@@ -229,6 +231,8 @@ impl Builder {
                default_headers,
                retry,
                allow_private_ip: false,
+               #[cfg(test)]
+               skip_url_validation: false,
             };
 
             let state = HttpClientState::new(client, allowlist, config);
