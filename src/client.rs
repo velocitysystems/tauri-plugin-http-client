@@ -7,6 +7,8 @@ use futures_util::StreamExt;
 use parking_lot::RwLock;
 use reqwest::redirect;
 
+use reqwest::header::HeaderMap;
+
 use crate::allowlist::{DomainAllowlist, is_private_ip};
 use crate::config::{HttpClientConfig, RetryConfig};
 use crate::error::{Error, Result};
@@ -40,6 +42,62 @@ const FORBIDDEN_HEADERS: &[&str] = &[
 /// - `proxy-`: Proxy control headers (`Proxy-Authorization`, `Proxy-Connection`).
 ///   These affect proxy routing in ways outside the plugin's security model.
 const FORBIDDEN_HEADER_PREFIXES: &[&str] = &["sec-", "proxy-"];
+
+/// Internal response type shared between the IPC and backend paths.
+///
+/// Carries native `reqwest` types so that each path can convert to its own
+/// public type without intermediate re-encoding.
+struct RawResponse {
+   status: reqwest::StatusCode,
+   headers: HeaderMap,
+   url: url::Url,
+   redirected: bool,
+   body: Vec<u8>,
+}
+
+impl RawResponse {
+   /// Converts to the IPC-oriented [`ExecuteResult`] (string headers,
+   /// numeric status).
+   fn into_execute_result(self, retry_count: u32) -> ExecuteResult {
+      let mut response_headers: HashMap<String, Vec<String>> = HashMap::new();
+
+      for (name, value) in &self.headers {
+         let name = name.as_str().to_string();
+
+         if let Ok(v) = value.to_str() {
+            response_headers
+               .entry(name)
+               .or_default()
+               .push(v.to_string());
+         }
+      }
+
+      ExecuteResult {
+         metadata: FetchResponseMetadata {
+            status: self.status.as_u16(),
+            status_text: self.status.canonical_reason().unwrap_or("").to_string(),
+            headers: response_headers,
+            url: self.url.to_string(),
+            redirected: self.redirected,
+            retry_count,
+         },
+         body: self.body,
+      }
+   }
+
+   /// Converts to the backend-oriented [`Response`](crate::response::Response)
+   /// (native `reqwest` types).
+   fn into_response(self, retry_count: u32) -> crate::response::Response {
+      crate::response::Response::new(
+         self.status,
+         self.headers,
+         self.url,
+         self.redirected,
+         self.body,
+         retry_count,
+      )
+   }
+}
 
 /// Validates that a header name is not in the forbidden list.
 ///
@@ -262,8 +320,7 @@ impl HttpClientState {
    /// 2. Build the reqwest request (method, headers, body, timeout)
    /// 3. Execute with custom redirect policy
    /// 4. Read response body with size limit enforcement
-   /// 5. Detect text vs binary content and encode accordingly
-   /// 6. Return structured response
+   /// 5. Return structured response
    ///
    /// # Retry Behavior
    ///
@@ -293,17 +350,98 @@ impl HttpClientState {
          .timeout_ms
          .map(Duration::from_millis)
          .or(self.config.default_timeout);
-
       let max_retries = self.resolve_max_retries(&req);
-      let max_attempts = max_retries + 1;
-      let retry_config = &self.config.retry;
-      let method_retryable = retry_config.is_retryable_method(method.as_str());
 
       // Parse and validate URL once before the retry loop. The URL string
       // doesn't change between retries, so re-parsing is unnecessary.
       let url = self.allowlist.read().validate_url(&req.url)?;
 
-      let mut last_result: Option<Result<ExecuteResult>> = None;
+      // Build a merged HeaderMap: default headers first, then per-request
+      // headers (which override defaults). Validates forbidden headers.
+      let merged_headers = self.build_ipc_header_map(&req.headers)?;
+
+      let (raw, attempt) = self
+         .execute_with_retry(
+            &url,
+            &method,
+            &merged_headers,
+            body_bytes.as_deref(),
+            timeout,
+            max_retries,
+         )
+         .await?;
+
+      Ok(raw.into_execute_result(attempt))
+   }
+
+   /// Executes an HTTP request from Rust backend code, returning a native
+   /// [`Response`](crate::response::Response) with `reqwest` types.
+   ///
+   /// This is the backend counterpart to [`execute`](Self::execute) (which
+   /// serves the IPC/frontend path). It follows the same security pipeline:
+   /// domain allowlist, private IP blocking, redirect validation, streaming
+   /// body limits, and retry.
+   ///
+   /// Called by [`RequestBuilder::send`](crate::request::RequestBuilder::send).
+   pub(crate) async fn execute_backend(
+      &self,
+      url: &str,
+      method: reqwest::Method,
+      headers: &[(String, String)],
+      body: Option<&[u8]>,
+      timeout: Option<Duration>,
+      max_retries: Option<u32>,
+   ) -> Result<crate::response::Response> {
+      let timeout = timeout.or(self.config.default_timeout);
+      let max_retries = match max_retries {
+         Some(n) => n.min(self.config.retry.max_retries),
+         None => self.config.retry.max_retries,
+      };
+
+      // Build a merged HeaderMap: default headers first, then per-request
+      // headers (which override defaults). Validates forbidden headers.
+      let merged_headers = self.build_backend_header_map(headers)?;
+
+      let url = self.validate_url_for_request(url)?;
+
+      let (raw, attempt) = self
+         .execute_with_retry(&url, &method, &merged_headers, body, timeout, max_retries)
+         .await?;
+
+      Ok(raw.into_response(attempt))
+   }
+
+   /// Shared retry loop used by both [`execute`](Self::execute) (IPC path)
+   /// and [`execute_backend`](Self::execute_backend) (Rust backend path).
+   ///
+   /// Expects the URL to be pre-validated and headers pre-merged by the
+   /// caller. Returns the final [`RawResponse`] and the attempt count
+   /// (0 = succeeded on first try, 1+ = number of retries performed).
+   ///
+   /// # Retry Behavior
+   ///
+   /// When retry is enabled (`max_retries > 0`), transient errors
+   /// (connection failures, timeouts) and retryable status codes trigger
+   /// automatic retries with exponential backoff and jitter. Security
+   /// errors are never retried.
+   ///
+   /// The URL is re-validated against the allowlist on every retry attempt.
+   /// If the allowlist changes between retries (e.g., a domain is removed),
+   /// the subsequent attempt fails with `DomainNotAllowed` (fail-secure).
+   async fn execute_with_retry(
+      &self,
+      url: &url::Url,
+      method: &reqwest::Method,
+      headers: &HeaderMap,
+      body: Option<&[u8]>,
+      timeout: Option<Duration>,
+      max_retries: u32,
+   ) -> Result<(RawResponse, u32)> {
+      let max_attempts = max_retries + 1;
+      let retry_config = &self.config.retry;
+      let method_retryable = retry_config.is_retryable_method(method.as_str());
+
+      let mut last_result: Option<Result<RawResponse>> = None;
       let mut attempt: u32 = 0;
 
       // Bounded: returns when attempt + 1 >= max_attempts (should_retry = false)
@@ -316,7 +454,7 @@ impl HttpClientState {
             tracing::error!(
                attempt,
                max_attempts,
-               url = %req.url,
+               url = %url,
                "retry loop exceeded max_attempts; this is a bug"
             );
             return Err(Error::Other(format!(
@@ -331,7 +469,7 @@ impl HttpClientState {
                attempt,
                max_attempts,
                backoff_ms = backoff.as_millis() as u64,
-               url = %req.url,
+               url = %url,
                "retrying request"
             );
 
@@ -342,18 +480,16 @@ impl HttpClientState {
             // retries must cause immediate failure (fail-secure). We use
             // validate_parsed_url (not validate_url) to avoid redundant
             // string parsing since the URL itself hasn't changed.
-            self.allowlist.read().validate_parsed_url(&url)?;
+            self.revalidate_parsed_url(url)?;
          }
 
-         let result = self
-            .execute_once(&url, &method, &req.headers, body_bytes.as_deref(), timeout)
-            .await;
+         let result = self.execute_once(url, method, headers, body, timeout).await;
 
          let should_retry = attempt + 1 < max_attempts && method_retryable;
 
          match result {
             Ok(ref resp)
-               if should_retry && retry_config.is_retryable_status(resp.metadata.status) =>
+               if should_retry && retry_config.is_retryable_status(resp.status.as_u16()) =>
             {
                last_result = Some(result);
                attempt += 1;
@@ -362,42 +498,98 @@ impl HttpClientState {
                last_result = Some(Err(e));
                attempt += 1;
             }
-            Ok(mut resp) => {
-               resp.metadata.retry_count = attempt;
-               return Ok(resp);
-            }
+            Ok(raw) => return Ok((raw, attempt)),
             Err(e) => return Err(e),
          }
       }
    }
 
+   /// Validates a URL string against the domain allowlist, returning a parsed
+   /// [`Url`](url::Url).
+   ///
+   /// In `#[cfg(test)]` builds with `skip_url_validation` enabled, performs
+   /// only basic URL parsing without allowlist or scheme checks.
+   fn validate_url_for_request(&self, url: &str) -> Result<url::Url> {
+      #[cfg(test)]
+      if self.config.skip_url_validation {
+         return url::Url::parse(url).map_err(|e| Error::InvalidUrl(e.to_string()));
+      }
+
+      self.allowlist.read().validate_url(url)
+   }
+
+   /// Re-validates an already-parsed URL against the domain allowlist.
+   ///
+   /// Used on retry attempts to enforce fail-secure behavior when the
+   /// allowlist changes between retries. Skips validation in
+   /// `#[cfg(test)]` builds with `skip_url_validation` enabled.
+   fn revalidate_parsed_url(&self, url: &url::Url) -> Result<()> {
+      #[cfg(test)]
+      if self.config.skip_url_validation {
+         return Ok(());
+      }
+
+      self.allowlist.read().validate_parsed_url(url)
+   }
+
+   /// Builds a merged [`HeaderMap`] from the plugin's default headers and
+   /// per-request backend headers (slice of tuples).
+   ///
+   /// Default headers are applied first; per-request headers override them.
+   /// All header names are validated against the forbidden-header list.
+   fn build_backend_header_map(&self, request_headers: &[(String, String)]) -> Result<HeaderMap> {
+      merge_headers(
+         &self.config.default_headers,
+         request_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+      )
+   }
+
+   /// Starts building a GET request through the plugin's security pipeline.
+   ///
+   /// Returns a [`RequestBuilder`](crate::request::RequestBuilder) that can
+   /// be customized with headers, timeout, and retry settings before sending.
+   pub fn get(&self, url: impl Into<String>) -> crate::request::RequestBuilder<'_> {
+      crate::request::RequestBuilder::new(self, reqwest::Method::GET, url.into())
+   }
+
+   /// Starts building a POST request through the plugin's security pipeline.
+   pub fn post(&self, url: impl Into<String>) -> crate::request::RequestBuilder<'_> {
+      crate::request::RequestBuilder::new(self, reqwest::Method::POST, url.into())
+   }
+
+   /// Starts building a request with an arbitrary HTTP method.
+   pub fn request(
+      &self,
+      method: reqwest::Method,
+      url: impl Into<String>,
+   ) -> crate::request::RequestBuilder<'_> {
+      crate::request::RequestBuilder::new(self, method, url.into())
+   }
+
    /// Executes a single HTTP request attempt through the full pipeline.
    ///
    /// This is the inner implementation called by [`execute`](Self::execute)
-   /// on each attempt. It assumes URL validation has already been performed.
+   /// and [`execute_backend`](Self::execute_backend) on each attempt. It
+   /// assumes URL validation has already been performed and headers have
+   /// been pre-validated and merged into a [`HeaderMap`].
    ///
-   /// Returns raw body bytes and metadata. Encoding for IPC transfer
-   /// (binary framing or JSON with base64) happens at the command layer.
+   /// Returns a [`RawResponse`] carrying native `reqwest` types. Conversion
+   /// to the caller's public type (`ExecuteResult` for IPC, `Response` for
+   /// backend) happens after the retry loop.
    async fn execute_once(
       &self,
       url: &url::Url,
       method: &reqwest::Method,
-      headers: &Option<HashMap<String, String>>,
+      headers: &HeaderMap,
       body: Option<&[u8]>,
       timeout: Option<Duration>,
-   ) -> Result<ExecuteResult> {
+   ) -> Result<RawResponse> {
       let mut builder = self.client.request(method.clone(), url.clone());
 
-      for (key, value) in &self.config.default_headers {
-         builder = builder.header(key.as_str(), value.as_str());
-      }
-
-      if let Some(headers) = headers {
-         for (key, value) in headers {
-            validate_header_name(key)?;
-            builder = builder.header(key.as_str(), value.as_str());
-         }
-      }
+      // Clone required: reqwest's builder.headers() takes HeaderMap by value.
+      builder = builder.headers(headers.clone());
 
       if let Some(body) = body {
          builder = builder.body(body.to_vec());
@@ -436,33 +628,14 @@ impl HttpClientState {
       }
 
       let status = response.status();
-      let status_text = status.canonical_reason().unwrap_or("").to_string();
-
-      // Collect response headers (multi-value support)
-      let mut response_headers: HashMap<String, Vec<String>> = HashMap::new();
-
-      for (name, value) in response.headers() {
-         let name = name.as_str().to_string();
-
-         if let Ok(v) = value.to_str() {
-            response_headers
-               .entry(name)
-               .or_default()
-               .push(v.to_string());
-         }
-      }
-
+      let resp_headers = response.headers().clone();
       let body_bytes = self.read_body_with_limit(response).await?;
 
-      Ok(ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: status.as_u16(),
-            status_text,
-            headers: response_headers,
-            url: final_url.to_string(),
-            redirected,
-            retry_count: 0, // Set by execute() after the loop
-         },
+      Ok(RawResponse {
+         status,
+         headers: resp_headers,
+         url: final_url,
+         redirected,
          body: body_bytes,
       })
    }
@@ -514,6 +687,24 @@ impl HttpClientState {
       }
    }
 
+   /// Builds a merged [`HeaderMap`] from the plugin's default headers and
+   /// optional per-request IPC headers.
+   ///
+   /// Default headers are applied first; per-request headers override them.
+   /// All header names are validated against the forbidden-header list.
+   fn build_ipc_header_map(
+      &self,
+      request_headers: &Option<HashMap<String, String>>,
+   ) -> Result<HeaderMap> {
+      let empty = HashMap::new();
+      let headers = request_headers.as_ref().unwrap_or(&empty);
+
+      merge_headers(
+         &self.config.default_headers,
+         headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+      )
+   }
+
    /// Aborts an in-flight request by ID.
    ///
    /// Returns `true` if a request with the given ID was found and aborted,
@@ -533,6 +724,94 @@ impl HttpClientState {
          false
       }
    }
+}
+
+/// Test-only constructor for `HttpClientState`.
+///
+/// Bypasses domain allowlist validation and private IP checks, allowing
+/// tests to use local mock servers on `127.0.0.1`.
+///
+/// **Only available in `#[cfg(test)]` builds.**
+///
+/// # Testing downstream crates
+///
+/// `for_testing()` is `#[cfg(test)]`-gated and is not available to downstream
+/// consumers. Downstream crates that use the backend API (`get`, `post`,
+/// `request`) via [`tauri::State<HttpClientState>`] should test against a real
+/// `HttpClientState` registered by the plugin. Set up the plugin with
+/// `Builder::new().allowed_domains(["localhost"]).build()` and start your mock
+/// server on `localhost` (or a DNS-resolvable hostname that is allowlisted).
+///
+/// If your mock server binds to `127.0.0.1` rather than `localhost`, configure
+/// it to also listen on `localhost` so the domain allowlist check passes.
+#[cfg(test)]
+impl HttpClientState {
+   /// Creates an `HttpClientState` suitable for unit/integration tests with
+   /// local mock servers.
+   ///
+   /// Skips all URL validation (scheme, IP-literal, domain allowlist) and
+   /// allows requests to private/loopback IP addresses. This enables tests
+   /// using any local mock server bound to `127.0.0.1`.
+   ///
+   /// # Behavioral differences from production
+   ///
+   /// - **No redirect validation**: Uses reqwest's default redirect policy
+   ///   (follow up to 10 hops) instead of [`build_redirect_policy`] — redirects
+   ///   are not validated against the domain allowlist.
+   /// - **No default header validation**: Default headers are not checked
+   ///   against the forbidden-header list at construction time (they are still
+   ///   validated per-request via [`merge_headers`]).
+   /// - **No custom redirect limit**: Uses reqwest's default (10) instead of
+   ///   `HttpClientConfig::max_redirects`.
+   pub fn for_testing() -> Self {
+      let allowlist = Arc::new(RwLock::new(
+         DomainAllowlist::new(Vec::<String>::new()).expect("empty allowlist is always valid"),
+      ));
+      let client = reqwest::Client::builder()
+         .build()
+         .expect("default reqwest client should build");
+      let config = HttpClientConfig {
+         allow_private_ip: true,
+         #[cfg(test)]
+         skip_url_validation: true,
+         ..HttpClientConfig::default()
+      };
+
+      Self::new(client, allowlist, config)
+   }
+}
+
+/// Builds a merged [`HeaderMap`] from default headers and per-request headers.
+///
+/// Default headers are applied first; per-request headers override defaults
+/// with the same name. All per-request header names are validated against the
+/// forbidden-header list.
+fn merge_headers<'a>(
+   defaults: &HashMap<String, String>,
+   per_request: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<HeaderMap> {
+   let mut map = HeaderMap::new();
+
+   for (key, value) in defaults {
+      map.insert(
+         reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| Error::Other(format!("invalid default header name '{key}': {e}")))?,
+         reqwest::header::HeaderValue::from_str(value)
+            .map_err(|e| Error::Other(format!("invalid default header value for '{key}': {e}")))?,
+      );
+   }
+
+   for (key, value) in per_request {
+      validate_header_name(key)?;
+      map.insert(
+         reqwest::header::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| Error::Other(format!("invalid header name '{key}': {e}")))?,
+         reqwest::header::HeaderValue::from_str(value)
+            .map_err(|e| Error::Other(format!("invalid header value for '{key}': {e}")))?,
+      );
+   }
+
+   Ok(map)
 }
 
 fn parse_method(method: &str) -> Result<reqwest::Method> {
@@ -568,7 +847,7 @@ fn decode_request_body(body: &str, encoding: Option<&BodyEncoding>) -> Result<Ve
 fn calculate_backoff(
    config: &RetryConfig,
    attempt: u32,
-   last_result: Option<&Result<ExecuteResult>>,
+   last_result: Option<&Result<RawResponse>>,
 ) -> Duration {
    // Check for Retry-After header on the last response
    if let Some(Ok(resp)) = last_result
@@ -603,11 +882,16 @@ fn calculate_backoff(
 ///
 /// Supports both delta-seconds format (`Retry-After: 120`) and ignores
 /// HTTP-date format (too complex to parse without a date library).
-fn parse_retry_after_from_response(resp: &ExecuteResult) -> Option<Duration> {
-   let values = resp.metadata.headers.get("retry-after")?;
-   let value = values.first()?;
+fn parse_retry_after_from_response(resp: &RawResponse) -> Option<Duration> {
+   let value = resp.headers.get("retry-after")?;
 
-   value.trim().parse::<u64>().ok().map(Duration::from_secs)
+   value
+      .to_str()
+      .ok()?
+      .trim()
+      .parse::<u64>()
+      .ok()
+      .map(Duration::from_secs)
 }
 
 /// Builds a custom redirect policy that validates each redirect hop against the allowlist.
@@ -682,6 +966,18 @@ impl std::error::Error for RedirectBlockedError {}
 #[cfg(test)]
 mod tests {
    use super::*;
+
+   /// Helper to build a `RawResponse` for tests that need to exercise
+   /// `calculate_backoff` and `parse_retry_after_from_response`.
+   fn raw_response_with_headers(headers: HeaderMap) -> RawResponse {
+      RawResponse {
+         status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+         headers,
+         url: url::Url::parse("https://example.com").unwrap(),
+         redirected: false,
+         body: Vec::new(),
+      }
+   }
 
    #[test]
    fn test_parse_method() {
@@ -1582,17 +1878,9 @@ mod tests {
    #[test]
    fn test_calculate_backoff_with_retry_after_header() {
       let config = RetryConfig::default();
-      let resp = ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: 429,
-            status_text: "Too Many Requests".to_string(),
-            headers: HashMap::from([("retry-after".to_string(), vec!["5".to_string()])]),
-            url: "https://example.com".to_string(),
-            redirected: false,
-            retry_count: 0,
-         },
-         body: Vec::new(),
-      };
+      let mut headers = HeaderMap::new();
+      headers.insert("retry-after", "5".parse().unwrap());
+      let resp = raw_response_with_headers(headers);
 
       let backoff = calculate_backoff(&config, 1, Some(&Ok(resp)));
 
@@ -1605,17 +1893,9 @@ mod tests {
          max_retry_after: Duration::from_secs(10),
          ..RetryConfig::default()
       };
-      let resp = ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: 429,
-            status_text: "Too Many Requests".to_string(),
-            headers: HashMap::from([("retry-after".to_string(), vec!["999".to_string()])]),
-            url: "https://example.com".to_string(),
-            redirected: false,
-            retry_count: 0,
-         },
-         body: Vec::new(),
-      };
+      let mut headers = HeaderMap::new();
+      headers.insert("retry-after", "999".parse().unwrap());
+      let resp = raw_response_with_headers(headers);
 
       let backoff = calculate_backoff(&config, 1, Some(&Ok(resp)));
 
@@ -1624,17 +1904,9 @@ mod tests {
 
    #[test]
    fn test_parse_retry_after_valid_seconds() {
-      let resp = ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: 429,
-            status_text: "Too Many Requests".to_string(),
-            headers: HashMap::from([("retry-after".to_string(), vec!["120".to_string()])]),
-            url: "https://example.com".to_string(),
-            redirected: false,
-            retry_count: 0,
-         },
-         body: Vec::new(),
-      };
+      let mut headers = HeaderMap::new();
+      headers.insert("retry-after", "120".parse().unwrap());
+      let resp = raw_response_with_headers(headers);
 
       assert_eq!(
          parse_retry_after_from_response(&resp),
@@ -1644,54 +1916,28 @@ mod tests {
 
    #[test]
    fn test_parse_retry_after_missing_header() {
-      let resp = ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: 503,
-            status_text: "Service Unavailable".to_string(),
-            headers: HashMap::new(),
-            url: "https://example.com".to_string(),
-            redirected: false,
-            retry_count: 0,
-         },
-         body: Vec::new(),
-      };
+      let resp = raw_response_with_headers(HeaderMap::new());
 
       assert_eq!(parse_retry_after_from_response(&resp), None);
    }
 
    #[test]
    fn test_parse_retry_after_non_numeric_ignored() {
-      let resp = ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: 429,
-            status_text: "Too Many Requests".to_string(),
-            headers: HashMap::from([(
-               "retry-after".to_string(),
-               vec!["Wed, 21 Oct 2025 07:28:00 GMT".to_string()],
-            )]),
-            url: "https://example.com".to_string(),
-            redirected: false,
-            retry_count: 0,
-         },
-         body: Vec::new(),
-      };
+      let mut headers = HeaderMap::new();
+      headers.insert(
+         "retry-after",
+         "Wed, 21 Oct 2025 07:28:00 GMT".parse().unwrap(),
+      );
+      let resp = raw_response_with_headers(headers);
 
       assert_eq!(parse_retry_after_from_response(&resp), None);
    }
 
    #[test]
    fn test_parse_retry_after_zero_seconds() {
-      let resp = ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: 429,
-            status_text: "Too Many Requests".to_string(),
-            headers: HashMap::from([("retry-after".to_string(), vec!["0".to_string()])]),
-            url: "https://example.com".to_string(),
-            redirected: false,
-            retry_count: 0,
-         },
-         body: Vec::new(),
-      };
+      let mut headers = HeaderMap::new();
+      headers.insert("retry-after", "0".parse().unwrap());
+      let resp = raw_response_with_headers(headers);
 
       assert_eq!(
          parse_retry_after_from_response(&resp),
@@ -1702,17 +1948,9 @@ mod tests {
    #[test]
    fn test_calculate_backoff_with_retry_after_zero() {
       let config = RetryConfig::default();
-      let resp = ExecuteResult {
-         metadata: FetchResponseMetadata {
-            status: 429,
-            status_text: "Too Many Requests".to_string(),
-            headers: HashMap::from([("retry-after".to_string(), vec!["0".to_string()])]),
-            url: "https://example.com".to_string(),
-            redirected: false,
-            retry_count: 0,
-         },
-         body: Vec::new(),
-      };
+      let mut headers = HeaderMap::new();
+      headers.insert("retry-after", "0".parse().unwrap());
+      let resp = raw_response_with_headers(headers);
 
       let backoff = calculate_backoff(&config, 1, Some(&Ok(resp)));
 
@@ -2660,5 +2898,112 @@ mod tests {
    fn test_validate_header_name_sec_prefix_not_blocked_without_dash() {
       // "sec" alone is not in FORBIDDEN_HEADERS and doesn't start with "sec-"
       assert!(validate_header_name("sec").is_ok());
+   }
+
+   // --- merge_headers tests ---
+
+   #[test]
+   fn test_merge_headers_empty_defaults_empty_request() {
+      let defaults = HashMap::new();
+      let map = merge_headers(&defaults, std::iter::empty()).unwrap();
+
+      assert!(map.is_empty());
+   }
+
+   #[test]
+   fn test_merge_headers_defaults_only() {
+      let defaults = HashMap::from([("x-app".to_string(), "myapp".to_string())]);
+      let map = merge_headers(&defaults, std::iter::empty()).unwrap();
+
+      assert_eq!(map.get("x-app").unwrap(), "myapp");
+   }
+
+   #[test]
+   fn test_merge_headers_request_only() {
+      let defaults = HashMap::new();
+      let map = merge_headers(&defaults, vec![("accept", "application/json")].into_iter()).unwrap();
+
+      assert_eq!(map.get("accept").unwrap(), "application/json");
+   }
+
+   #[test]
+   fn test_merge_headers_request_overrides_default() {
+      let defaults = HashMap::from([("accept".to_string(), "text/html".to_string())]);
+      let map = merge_headers(&defaults, vec![("accept", "application/json")].into_iter()).unwrap();
+
+      assert_eq!(map.get("accept").unwrap(), "application/json");
+   }
+
+   #[test]
+   fn test_merge_headers_forbidden_header_rejected() {
+      let defaults = HashMap::new();
+      let result = merge_headers(&defaults, vec![("host", "evil.com")].into_iter());
+
+      assert!(result.is_err());
+   }
+
+   #[test]
+   fn test_merge_headers_defaults_not_validated_against_forbidden() {
+      // Default headers are validated at plugin init, not in merge_headers.
+      // merge_headers only validates per-request headers.
+      let defaults = HashMap::from([("x-custom".to_string(), "value".to_string())]);
+      let map = merge_headers(&defaults, std::iter::empty()).unwrap();
+
+      assert_eq!(map.get("x-custom").unwrap(), "value");
+   }
+
+   #[test]
+   fn test_merge_headers_multiple_request_headers() {
+      let defaults = HashMap::new();
+      let map = merge_headers(
+         &defaults,
+         vec![
+            ("accept", "application/json"),
+            ("authorization", "Bearer token"),
+         ]
+         .into_iter(),
+      )
+      .unwrap();
+
+      assert_eq!(map.get("accept").unwrap(), "application/json");
+      assert_eq!(map.get("authorization").unwrap(), "Bearer token");
+   }
+
+   // --- for_testing tests ---
+
+   #[test]
+   fn test_for_testing_creates_valid_state() {
+      let state = HttpClientState::for_testing();
+
+      assert!(state.config.allow_private_ip);
+      assert!(state.config.skip_url_validation);
+      assert!(state.is_allowlist_empty());
+   }
+
+   // --- validate_url_for_request / revalidate_parsed_url tests ---
+
+   #[test]
+   fn test_validate_url_for_request_skips_allowlist_in_test() {
+      let state = HttpClientState::for_testing();
+      let url = state.validate_url_for_request("http://127.0.0.1:8080/test");
+
+      assert!(url.is_ok());
+      assert_eq!(url.unwrap().as_str(), "http://127.0.0.1:8080/test");
+   }
+
+   #[test]
+   fn test_validate_url_for_request_rejects_invalid_url() {
+      let state = HttpClientState::for_testing();
+      let result = state.validate_url_for_request("not a url");
+
+      assert!(result.is_err());
+   }
+
+   #[test]
+   fn test_revalidate_parsed_url_skips_in_test() {
+      let state = HttpClientState::for_testing();
+      let url = url::Url::parse("http://127.0.0.1:8080/test").unwrap();
+
+      assert!(state.revalidate_parsed_url(&url).is_ok());
    }
 }

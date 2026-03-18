@@ -88,6 +88,21 @@
          </div>
       </section>
 
+      <!-- Rust Backend Request Panel -->
+      <section class="panel">
+         <h2>Rust Backend Request</h2>
+         <p class="hint">
+            Invokes a Tauri command that makes an HTTP request from Rust using
+            <code>app.http_client().get(url).send()</code> &mdash; the same security
+            pipeline as the frontend, but from backend code.
+         </p>
+         <div class="controls">
+            <input type="text" id="rust-url" value="https://httpbin.org/get" placeholder="URL">
+            <button id="rust-send">Fetch from Rust</button>
+         </div>
+         <pre id="rust-output" class="output">Response will appear here...</pre>
+      </section>
+
    </div>
 
    <script type="module" src="/main.js"></script>

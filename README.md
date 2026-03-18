@@ -22,6 +22,8 @@ requests from Tauri applications.
      support
    * Binary request and response bodies
    * Runtime allowlist management from Rust
+   * Rust backend API -- make HTTP requests from Rust
+     through the same security pipeline as the frontend
 
 
 ## Installation
@@ -268,8 +270,68 @@ try {
 See [`HttpErrorCode`](guest-js/errors.ts) for the full
 list of error codes and descriptions.
 
+### Rust Backend Requests
+
+The plugin exposes a Rust API for making HTTP requests
+from backend code through the same security pipeline
+(domain allowlist, private IP blocking, redirect
+validation, body size limits, retry) as the frontend.
+
+```rust
+use tauri::Manager;
+use tauri_plugin_http_client::HttpClientExt;
+
+#[tauri::command]
+async fn fetch_data(
+   app: tauri::AppHandle,
+) -> Result<String, String> {
+   let resp = app.http_client()
+      .get("https://api.example.com/data")
+      .header("Accept", "application/json")
+      .timeout(std::time::Duration::from_secs(10))
+      .send()
+      .await
+      .map_err(|e| e.to_string())?;
+
+   resp.text()
+      .map(|s| s.to_string())
+      .map_err(|e| e.to_string())
+}
+```
+
+> `send()` returns
+> `tauri_plugin_http_client::error::Error`, which
+> provides `is_retryable()` for retry decisions and can
+> be matched on specific variants (e.g.,
+> `Error::DomainNotAllowed`). Response body methods like
+> `text()` return standard library errors.
+
+Available builder methods:
+
+   * `get(url)` / `post(url)` -- convenience starters
+   * `request(method, url)` -- arbitrary HTTP method
+   * `.header(key, val)` -- add a header (repeatable)
+   * `.body(bytes)` -- set the request body
+   * `.timeout(duration)` -- per-request timeout
+   * `.max_retries(n)` -- per-request retry cap
+   * `.send()` -- execute through the security pipeline
+
+The response provides native `reqwest` types:
+
+   * `status()` -- `reqwest::StatusCode`
+   * `headers()` -- `&reqwest::header::HeaderMap`
+   * `url()` -- `&url::Url` (final URL after redirects)
+   * `redirected()` -- `bool`
+   * `body()` / `into_body()` -- `&[u8]` / `Vec<u8>`
+   * `text()` -- `Result<&str, std::str::Utf8Error>`
+   * `retry_count()` -- number of retries performed
+
 
 ## Security
+
+Both the TypeScript frontend and Rust backend API share
+the same security pipeline. All protections below apply
+equally to both paths.
 
 ### Domain Allowlist
 

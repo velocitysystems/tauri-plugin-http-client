@@ -22,6 +22,16 @@ pub struct HttpClientConfig {
    /// **Default: `false`.** Do not enable in production — the DNS rebinding
    /// check is a defense-in-depth layer against SSRF.
    pub(crate) allow_private_ip: bool,
+
+   /// Disables URL validation against the domain allowlist.
+   ///
+   /// When `true`, requests bypass `validate_url()` / `validate_parsed_url()`
+   /// entirely. Only intended for integration tests using local mock servers
+   /// where the URL contains an IP literal that the allowlist would reject.
+   ///
+   /// **Default: `false`.** Only available in `#[cfg(test)]` builds.
+   #[cfg(test)]
+   pub(crate) skip_url_validation: bool,
 }
 
 impl Default for HttpClientConfig {
@@ -35,6 +45,9 @@ impl Default for HttpClientConfig {
          default_headers: HashMap::new(),
          retry: RetryConfig::disabled(),
          allow_private_ip: false,
+
+         #[cfg(test)]
+         skip_url_validation: false,
       }
    }
 }

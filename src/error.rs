@@ -84,7 +84,7 @@ impl Error {
    /// Security errors (`DomainNotAllowed`, `IpAddressNotAllowed`, etc.) are
    /// never retryable — they indicate policy violations that will not change
    /// between attempts.
-   pub(crate) fn is_retryable(&self) -> bool {
+   pub fn is_retryable(&self) -> bool {
       matches!(self, Error::Request(e) if e.is_timeout() || e.is_connect())
    }
 
