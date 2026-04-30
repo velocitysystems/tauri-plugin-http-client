@@ -559,6 +559,14 @@ impl HttpClientState {
       crate::request::RequestBuilder::new(self, reqwest::Method::POST, url.into())
    }
 
+   /// Starts building a HEAD request through the plugin's security pipeline.
+   ///
+   /// Returns a [`RequestBuilder`](crate::request::RequestBuilder) that can
+   /// be customized with headers, timeout, and retry settings before sending.
+   pub fn head(&self, url: impl Into<String>) -> crate::request::RequestBuilder<'_> {
+      crate::request::RequestBuilder::new(self, reqwest::Method::HEAD, url.into())
+   }
+
    /// Starts building a request with an arbitrary HTTP method.
    pub fn request(
       &self,
@@ -629,7 +637,15 @@ impl HttpClientState {
 
       let status = response.status();
       let resp_headers = response.headers().clone();
-      let body_bytes = self.read_body_with_limit(response).await?;
+      // HEAD responses have no body per RFC 9110 §9.3.2. The Content-Length
+      // header advertises the would-be GET body size, so passing through
+      // read_body_with_limit would spuriously reject HEADs against resources
+      // larger than max_response_body_size.
+      let body_bytes = if method == reqwest::Method::HEAD {
+         Vec::new()
+      } else {
+         self.read_body_with_limit(response).await?
+      };
 
       Ok(RawResponse {
          status,
@@ -1515,6 +1531,87 @@ mod tests {
 
       assert!(result.is_ok());
       assert!(result.unwrap().is_empty());
+   }
+
+   // --- HEAD request tests ---
+
+   #[tokio::test]
+   async fn test_head_succeeds_when_content_length_exceeds_body_limit() {
+      let server = MockServer::start().await;
+
+      // HEAD response with Content-Length advertising a large would-be body.
+      // wiremock sends no body for the HEAD response (correct per spec).
+      Mock::given(method("HEAD"))
+         .and(path("/big"))
+         .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", "100000000"))
+         .mount(&server)
+         .await;
+
+      // Body limit (100 bytes) is far smaller than advertised Content-Length.
+      let state = build_localhost_test_state(10, 100);
+      let mut req = make_request(&localhost_url(&server, "/big"));
+      req.method = Some("HEAD".to_string());
+
+      let resp = state.execute(req).await.expect("HEAD must not be rejected");
+
+      assert_eq!(resp.metadata.status, 200);
+      assert!(resp.body.is_empty(), "HEAD body must be empty");
+   }
+
+   #[tokio::test]
+   async fn test_head_preserves_response_headers() {
+      let server = MockServer::start().await;
+
+      Mock::given(method("HEAD"))
+         .and(path("/resource"))
+         .respond_with(
+            ResponseTemplate::new(200)
+               .insert_header("Content-Length", "50000000")
+               .insert_header("Content-Type", "application/octet-stream")
+               .insert_header("ETag", "\"abc123\""),
+         )
+         .mount(&server)
+         .await;
+
+      let state = build_localhost_test_state(10, 100);
+      let mut req = make_request(&localhost_url(&server, "/resource"));
+      req.method = Some("HEAD".to_string());
+
+      let resp = state.execute(req).await.unwrap();
+
+      let headers = &resp.metadata.headers;
+      let get_header = |name: &str| {
+         headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.first().map(String::as_str))
+      };
+
+      assert_eq!(get_header("content-length"), Some("50000000"));
+      assert_eq!(get_header("content-type"), Some("application/octet-stream"));
+      assert_eq!(get_header("etag"), Some("\"abc123\""));
+   }
+
+   #[tokio::test]
+   async fn test_get_still_rejects_oversized_content_length() {
+      // Regression guard: HEAD bypass must not weaken the GET-path body limit.
+      let server = MockServer::start().await;
+      let body = "x".repeat(2000);
+
+      Mock::given(method("GET"))
+         .and(path("/big"))
+         .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+         .mount(&server)
+         .await;
+
+      let state = build_localhost_test_state(10, 100);
+      let req = make_request(&localhost_url(&server, "/big"));
+      let err = state.execute(req).await.unwrap_err();
+
+      assert!(
+         matches!(err, Error::ResponseTooLarge { .. }),
+         "expected ResponseTooLarge, got: {err:?}"
+      );
    }
 
    // --- DNS rebinding tests ---

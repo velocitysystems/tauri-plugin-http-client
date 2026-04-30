@@ -308,7 +308,7 @@ async fn fetch_data(
 
 Available builder methods:
 
-   * `get(url)` / `post(url)` -- convenience starters
+   * `get(url)` / `post(url)` / `head(url)` -- convenience starters
    * `request(method, url)` -- arbitrary HTTP method
    * `.header(key, val)` -- add a header (repeatable)
    * `.body(bytes)` -- set the request body
