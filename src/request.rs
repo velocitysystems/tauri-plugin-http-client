@@ -5,7 +5,8 @@
 //! validation, streaming body limits, retry).
 //!
 //! Created by [`HttpClientState::get`](crate::client::HttpClientState::get),
-//! [`HttpClientState::post`](crate::client::HttpClientState::post), or
+//! [`HttpClientState::post`](crate::client::HttpClientState::post),
+//! [`HttpClientState::head`](crate::client::HttpClientState::head), or
 //! [`HttpClientState::request`](crate::client::HttpClientState::request).
 //!
 //! # Examples
@@ -34,7 +35,8 @@ use crate::response::Response;
 /// Fluent builder for Rust-side HTTP requests through the plugin security pipeline.
 ///
 /// Created by [`HttpClientState::get`](crate::client::HttpClientState::get),
-/// [`HttpClientState::post`](crate::client::HttpClientState::post), or
+/// [`HttpClientState::post`](crate::client::HttpClientState::post),
+/// [`HttpClientState::head`](crate::client::HttpClientState::head), or
 /// [`HttpClientState::request`](crate::client::HttpClientState::request).
 /// Call [`send`](RequestBuilder::send) to execute the request.
 ///
@@ -210,6 +212,10 @@ mod tests {
 
       assert_eq!(post.method, reqwest::Method::POST);
 
+      let head = state.head("https://example.com");
+
+      assert_eq!(head.method, reqwest::Method::HEAD);
+
       let put = state.request(reqwest::Method::PUT, "https://example.com");
 
       assert_eq!(put.method, reqwest::Method::PUT);
@@ -279,6 +285,28 @@ mod tests {
 
       assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
       assert_eq!(resp.text().unwrap(), "created");
+   }
+
+   #[tokio::test]
+   async fn test_send_head_request() {
+      let server = wiremock::MockServer::start().await;
+
+      wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+         .and(wiremock::matchers::path("/resource"))
+         .respond_with(wiremock::ResponseTemplate::new(200).insert_header("content-length", "1024"))
+         .mount(&server)
+         .await;
+
+      let state = test_state();
+      let resp = state
+         .head(format!("{}/resource", server.uri()))
+         .send()
+         .await
+         .unwrap();
+
+      assert_eq!(resp.status(), reqwest::StatusCode::OK);
+      assert_eq!(resp.headers().get("content-length").unwrap(), "1024");
+      assert!(resp.body().is_empty());
    }
 
    #[tokio::test]
